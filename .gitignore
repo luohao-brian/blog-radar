@@ -24,4 +24,7 @@ coverage.xml
 .DS_Store
 
 # Project Specific
+
 articles/
+
+logs/
