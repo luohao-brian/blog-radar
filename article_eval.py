@@ -9,7 +9,7 @@ import datetime
 import re
 
 # 配置日志
-logger = setup_logging("article_eval")
+logger = setup_logging("blog_radar.article_eval")
 
 # --- Prompts ---
 
