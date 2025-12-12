@@ -7,7 +7,7 @@ from contextlib import AsyncExitStack
 from typing import List, Dict, Any, Optional
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, BaseMessage
+from langchain_core.messages import HumanMessage, BaseMessage, SystemMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.prebuilt import create_react_agent
 
@@ -114,17 +114,37 @@ class Agent:
         await self.exit_stack.aclose()
         logger.info("MCP Session Closed")
 
+
+
     async def achat(self, messages: List[Dict[str, str]]) -> str:
         """
-        Async Chat (No Tools)
+        Async Chat (No Tools) - Handles full conversation history
         """
-        user_input = messages[-1].get("content", "")
+        lc_messages = []
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "system":
+                lc_messages.append(SystemMessage(content=content))
+            elif role == "user":
+                lc_messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                lc_messages.append(AIMessage(content=content))
+            else:
+                lc_messages.append(HumanMessage(content=content)) # Default back to user if unknown
+
         try:
-            response = await self.llm.ainvoke(user_input)
+            response = await self.llm.ainvoke(lc_messages)
             return str(response.content)
         except Exception as e:
             logger.error(f"Chat failed: {e}")
             return ""
+
+    def chat(self, messages: List[Dict[str, str]]) -> str:
+        """
+        Sync Chat (No Tools) wrapper
+        """
+        return asyncio.run(self.achat(messages))
 
     async def achat_with_tools(self, messages: List[Dict[str, str]]) -> str:
         """
