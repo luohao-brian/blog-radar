@@ -47,12 +47,17 @@ class MediumRetriever(Retriever):
             self.logger.error(f"加载配置文件 '{file_path}' 失败: {e}")
         return feeds
 
-    async def process_single_feed(self, feed_url: str, limit: int = None):
-        """处理单个 Feed 的所有文章"""
-        self.logger.info(f"\n开始处理 Feed: {feed_url}")
+    async def fetch_with_sem(self, sem, *args, **kwargs):
+        """带信号量的抓取 wrapper"""
+        async with sem:
+            await self.fetch_and_save(*args, **kwargs)
+
+    async def process_single_feed(self, feed_url: str, tasks: list, sem: asyncio.Semaphore, limit: int = None):
+        """处理单个 Feed 的所有文章 (添加任务到列表)"""
+        self.logger.info(f"\n开始解析 Feed: {feed_url}")
         category = self.determine_category_from_feed(feed_url)
 
-        # parse feed (sync)
+        # parse feed (sync) - feedparser is blocking, might want to run in executor if very slow, but usually fine
         d = feedparser.parse(feed_url)
         if not d.entries:
             self.logger.warning(f"  Feed '{feed_url}' 未找到任何文章条目。")
@@ -65,25 +70,41 @@ class MediumRetriever(Retriever):
 
             title = entry.title
             link = entry.link
-            self.logger.info(f"  [Feed Item {i+1}]")
-            await self.fetch_and_save(link, title, category, feed_url)
+            
+            # Add to tasks
+            # tasks.append(
+            #     self.fetch_with_sem(sem, link, title, category, feed_url)
+            # )
+            task = asyncio.create_task(self.fetch_with_sem(sem, link, title, category, feed_url))
+            task.add_done_callback(lambda t, task_title=title: self.logger.info(f"任务完成: {task_title}"))
+            tasks.append(task)
+            
+            self.logger.info(f"  [Feed Item {i+1}] 已加入抓取队列: {title}")
 
-    async def run(self, url=None, rss=None, limit=None):
+    async def run(self, urls=None, rss=None, limit=None):
         """执行主逻辑"""
-        self.logger.info("程序启动：Medium Retriever")
+        self.logger.info("程序启动：Medium Retriever (Concurrent)")
+
+        # 限制并发数，防止浏览器或 LLM 过载
+        CONCURRENCY_LIMIT = 3
+        sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        tasks = []
 
         async with self.agent:
-            if url:
-                # 处理单个 URL
-                self.logger.info(f"\n开始抓取指定 URL: {url}")
-                category = "single_url_fetch"
+            if urls:
+                # 处理 URL 列表
+                for url in urls:
+                    self.logger.info(f"加入 URL 任务: {url}")
+                    category = "single_url_fetch"
 
-                # 简单提取标题
-                path_parts = urlparse(url).path.split("/")
-                title = path_parts[-1] if path_parts[-1] else "untitled_article"
-                title = title.replace("-", "_")
+                    # 简单提取标题
+                    path_parts = urlparse(url).path.split("/")
+                    title = path_parts[-1] if path_parts[-1] else "untitled_article"
+                    title = title.replace("-", "_")
 
-                await self.fetch_and_save(url, title, category)
+                    task = asyncio.create_task(self.fetch_with_sem(sem, url, title, category))
+                    task.add_done_callback(lambda t, task_title=title: self.logger.info(f"任务完成: {task_title}"))
+                    tasks.append(task)
 
             elif rss:
                 # 处理 RSS 列表
@@ -92,20 +113,23 @@ class MediumRetriever(Retriever):
                     self.logger.error(f"从文件 '{rss}' 未加载到任何 Feed。")
                     return
 
+                # 这里我们先解析所有 Feeds 生成任务列表
                 for feed_url in feeds:
-                    await self.process_single_feed(feed_url, limit)
+                    await self.process_single_feed(feed_url, tasks, sem, limit)
             else:
                 self.logger.error("请提供 --url 或 --rss 参数")
+                return
 
-            # 等待所有后台任务完成
-            if self.tasks:
-                self.logger.info(f"等待 {len(self.tasks)} 个后台翻译任务完成...")
-                await asyncio.gather(*self.tasks, return_exceptions=True)
-                self.logger.info("所有后台任务已完成")
+            if tasks:
+                self.logger.info(f"\n开始执行 {len(tasks)} 个抓取任务 (并发度: {CONCURRENCY_LIMIT})...")
+                await asyncio.gather(*tasks)
+                self.logger.info("所有抓取任务已完成")
+            else:
+                self.logger.info("没有需要执行的任务。")
 
 
 @click.command()
-@click.option("--url", default=None, help="指定要抓取的单个文章 URL。")
+@click.option("--url", multiple=True, help="指定要抓取的单个文章 URL (可多次使用)。")
 @click.option(
     "--rss", type=click.Path(exists=True), help="指定要加载的 RSS 配置文件 (YAML)。"
 )
@@ -117,7 +141,7 @@ def main(url, rss, limit):
         sys.exit(1)
 
     try:
-        asyncio.run(retriever.run(url=url, rss=rss, limit=limit))
+        asyncio.run(retriever.run(urls=url, rss=rss, limit=limit))
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
     except Exception as e:

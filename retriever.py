@@ -41,7 +41,10 @@ class Retriever(ABC):
             mcp_config=self.config.get("mcp_config"),
             allowed_tools=allowed_tools
         )
-        self.tasks = set()  # Track async tasks
+        
+        # 浏览器操作互斥锁：防止并发导致的状态冲突（串号）
+        # 因 MCP Server 控制的浏览器实例通常只有一个活动页面上下文
+        self._lock = asyncio.Lock()
 
     def _load_config(self, path: str) -> Dict:
         """加载 JSON 配置文件"""
@@ -111,119 +114,252 @@ class Retriever(ABC):
         """
         核心逻辑：使用 Agent + MCP 抓取网页内容（仅提取，不翻译）
         优化：拦截工具输出直接获取内容，避免 LLM 复述
+        注意：加锁确保浏览器操作原子性
         """
-        self.logger.info(f"正在抓取内容 (Agent + MCP): {url}")
+        async with self._lock:
+            self.logger.info(f"正在抓取内容 (Agent + MCP): {url}")
 
-        prompt = self.get_extraction_prompt(url)
-        messages = [{"role": "user", "content": prompt}]
+            prompt = self.get_extraction_prompt(url)
+            messages = [{"role": "user", "content": prompt}]
 
-        try:
-            # 使用新方法获取完整状态
-            result_state = await self.agent.achat_with_tools_full(messages)
-            
-            messages_history = result_state.get("messages", [])
-            content = None
-            
-            # Debug: 打印所有 ToolMessage 用于排查
-            for i, msg in enumerate(messages_history):
-                if hasattr(msg, "tool_call_id"):
-                    self.logger.debug(f"MSG[{i}] ToolMessage: name={getattr(msg, 'name', 'N/A')}, content_len={len(str(msg.content))}")
-            
-            # 倒序查找 ToolMessage
-            for msg in reversed(messages_history):
-                if hasattr(msg, "tool_call_id") and hasattr(msg, "content"):
-                     msg_name = getattr(msg, "name", "")
-                     raw_content = msg.content
-                     extracted_text = ""
+            try:
+                # 使用新方法获取完整状态
+                result_state = await self.agent.achat_with_tools_full(messages)
+                
+                messages_history = result_state.get("messages", [])
+                content = None
+                
+                # Debug: 打印所有 ToolMessage 用于排查
+                for i, msg in enumerate(messages_history):
+                    if hasattr(msg, "tool_call_id"):
+                        self.logger.debug(f"MSG[{i}] ToolMessage: name={getattr(msg, 'name', 'N/A')}, content_len={len(str(msg.content))}")
+                
+                # 倒序查找 ToolMessage
+                for msg in reversed(messages_history):
+                    if hasattr(msg, "tool_call_id") and hasattr(msg, "content"):
+                         msg_name = getattr(msg, "name", "")
+                         raw_content = msg.content
+                         extracted_text = ""
 
-                     # 提取文本内容
-                     if isinstance(raw_content, list):
-                         for item in raw_content:
-                             if isinstance(item, dict) and item.get("type") == "text":
-                                 extracted_text += item.get("text", "")
-                     else:
-                         extracted_text = str(raw_content)
+                         # 提取文本内容
+                         if isinstance(raw_content, list):
+                             for item in raw_content:
+                                 if isinstance(item, dict) and item.get("type") == "text":
+                                     extracted_text += item.get("text", "")
+                         else:
+                             extracted_text = str(raw_content)
+                        
+                         # 判读逻辑：
+                         # 1. 如果有 name 属性且等于 evaluate_script，那就是它
+                         # 2. 如果没有 name (兼容性)，则检查内容特征 (包含 "evaluate_script response" 或长度极大且不像 navigate 响应)
+                         
+                         is_target = False
+                         if msg_name == "evaluate_script":
+                             is_target = True
+                         elif "navigate_page" in extracted_text and len(extracted_text) < 500:
+                             # 肯定是导航响应，跳过
+                             continue
+                         elif len(extracted_text) > 200:
+                             # 长度足够长，极有可能是文章
+                             is_target = True
+                        
+                         if is_target:
+                             content = extracted_text
+                             self.logger.info(f"  已从 ToolMessage (name={msg_name}) 中拦截到原始内容，长度: {len(content)}")
+                             break
+                
+                if content:
+                    # 清洗数据: 移除 "evaluate_script response..." 前缀
+                    if "Script ran on page and returned:" in content:
+                        content = content.split("Script ran on page and returned:")[-1].strip()
                     
-                     # 判读逻辑：
-                     # 1. 如果有 name 属性且等于 evaluate_script，那就是它
-                     # 2. 如果没有 name (兼容性)，则检查内容特征 (包含 "evaluate_script response" 或长度极大且不像 navigate 响应)
-                     
-                     is_target = False
-                     if msg_name == "evaluate_script":
-                         is_target = True
-                     elif "navigate_page" in extracted_text and len(extracted_text) < 500:
-                         # 肯定是导航响应，跳过
-                         continue
-                     elif len(extracted_text) > 200:
-                         # 长度足够长，极有可能是文章
-                         is_target = True
+                    # 移除 Markdown 代码块标记 (```json ... ```)
+                    if content.startswith("```json"):
+                        content = content[7:]
+                    if content.endswith("```"):
+                        content = content[:-3]
                     
-                     if is_target:
-                         content = extracted_text
-                         self.logger.info(f"  已从 ToolMessage (name={msg_name}) 中拦截到原始内容，长度: {len(content)}")
-                         break
-            
-            if content:
-                # 清洗数据: 移除 "evaluate_script response..." 前缀
-                if "Script ran on page and returned:" in content:
-                    content = content.split("Script ran on page and returned:")[-1].strip()
-                
-                # 移除 Markdown 代码块标记 (```json ... ```)
-                if content.startswith("```json"):
-                    content = content[7:]
-                if content.endswith("```"):
-                    content = content[:-3]
-                
-                content = content.strip()
-                
-                # 处理 JSON 字符串转义: JS 返回的是带双引号的 JSON 字符串
-                # 例如: "\n# Title\n\nContent..."
-                if content.startswith('"') and content.endswith('"'):
-                    try:
-                        # 使用 json.loads 解码转义字符 (\n, \t 等)
-                        content = json.loads(content)
-                    except json.JSONDecodeError:
-                        # Fallback: 手动处理最基本的转义
-                        self.logger.warning("  JSON decode failed, attempting manual cleanup")
-                        content = content[1:-1].replace('\\n', '\n').replace('\\"', '"')
-                
-                self.logger.info(f"  Fetch 最终提取内容预览 (前100字符): {content[:100].replace(chr(10), ' ')}...")
-                return content
-                
-            # Fallback
-            final_msg = messages_history[-1]
-            return str(final_msg.content)
+                    content = content.strip()
+                    
+                    # 处理 JSON 字符串转义: JS 返回的是带双引号的 JSON 字符串
+                    if content.startswith('"') and content.endswith('"'):
+                        try:
+                            content = json.loads(content)
+                        except json.JSONDecodeError:
+                            self.logger.warning("  JSON decode failed, attempting manual cleanup")
+                            content = content[1:-1].replace('\\n', '\n').replace('\\"', '"')
 
-        except Exception as e:
-            self.logger.error(f"  抓取失败: {e}")
-            return None
+                    # Medium 专用 Header 清洗
+                    content = self._clean_medium_header(content)
+                    
+                    # --- 内容验证 ---
+                    if not self._validate_content(content):
+                        self.logger.warning("  内容验证未通过 (Invalid Content)")
+                        return None
+                    
+                    self.logger.info(f"  Fetch 最终提取内容预览 (前100字符): {content[:100].replace(chr(10), ' ')}...")
+                    return content
+                    
+                # Fallback
+                final_msg = messages_history[-1]
+                content = str(final_msg.content)
+                
+                # 对 Fallback 内容也做验证
+                if self._validate_content(content):
+                     return content
+                else:
+                     self.logger.warning("  Fallback 内容验证未通过")
+                     return None
 
-    async def translate_article(self, content: str) -> Optional[str]:
+            except Exception as e:
+                self.logger.error(f"  抓取失败: {e}")
+                return None
+
+    def _clean_medium_header(self, content: str) -> str:
         """
-        翻译逻辑：将内容翻译为中文
+        专用过滤器: 清洗 Medium 的头部元数据 (Author, Following, Date, etc.)
+        目标格式: [AuthorName](https://medium.com/@AuthorID)
         """
-        self.logger.info(f"正在翻译内容 (Input Length: {len(content)})...")
-        self.logger.debug(f"翻译输入预览: {content[:100].replace(chr(10), ' ')}...")
+        # 1. 尝试提取作者信息
+        # 匹配模式: [Name](/@id?...) 或 [Name](https://medium.com/@id?...)
+        # 注意: 这里的 regex 需要适配 JS 提取出的 Markdown 格式
+        # 常见格式: [![Name](img)](link) [Name](link) Following...
         
-        prompt = self.get_translation_prompt(content)
-        messages = [{"role": "user", "content": prompt}]
-
-        try:
-            # 清除 Graph 历史状态（如果可能），或者创建一个新的 Agent 实例
-            # 但这里我们复用 Agent，所以要注意 Context 累积
-            # 如果 Agent 是有记忆的，这里可能会把之前的 Tool Output 也带进去
-            # 暂时假设 Prompt 足够强
+        # 查找作者链接 (通常在开头 1000 字符内)
+        head_section = content[:2000]
+        
+        # Regex to capture Name and ID from a link like [Name](/@id?...)
+        # We look for the patterns typically generated by the walker for the byline
+        author_match = re.search(r"\[([^\]]+)\]\((?:https://medium\.com)?/@([^?/\)]+)", head_section)
+        
+        clean_header = ""
+        if author_match:
+            name = author_match.group(1).strip()
+            user_id = author_match.group(2).strip()
+            # 构造标准链接
+            clean_header = f"[{name}](https://medium.com/@{user_id})\n\n"
+        
+        # 2. 移除干扰块
+        lines = content.split('\n')
+        new_lines = []
+        
+        header_processed = False
+        is_in_noise_block = False
+        
+        for i, line in enumerate(lines):
+            stripped = line.strip()
             
-            # 使用 achat (无 Tools) 进行纯文本翻译任务
-            translated_content = await self.agent.achat(messages)
-            if translated_content and len(translated_content) > 50:
-                 return translated_content
+            # 标题行直接保留
+            if stripped.startswith("# "):
+                new_lines.append(line)
+                continue
+                
+            # 如果是空行，保留
+            if not stripped:
+                new_lines.append(line)
+                continue
+            
+            is_noise = False
+            
+            # 特征 1: 包含 "Following" 和 "read" (e.g. "Following 12 min read")
+            if "Following" in stripped and "read" in stripped:
+                is_noise = True
+            
+            # 特征 2: 只是 "Listen", "Share", "More" 等短语
+            elif stripped in ["Listen", "Share", "More", "Open in app"]:
+                is_noise = True
+                
+            # 特征 3: 包含作者头像链接 ([![...](...))
+            elif stripped.startswith("[![") and "](/@" in stripped:
+                is_noise = True
+            
+            # 特征 4: 日期行 (e.g. Nov 4, 2025) - 往往和 Following 在一起，但也可能单独
+            elif "min read" in stripped:
+                is_noise = True
+            
+            # 特征 5: 纯数字 (Claps count) 或带单位数字 (1.2K)
+            elif re.match(r"^\d+(\.\d+)?[KkMm]?$", stripped):
+                is_noise = True
+                
+            if is_noise:
+                # 只有当我们还没有插入 clean header 时，如果是干扰块的一部分，我们替换它
+                if not header_processed and clean_header:
+                    new_lines.append(clean_header)
+                    header_processed = True
+                is_in_noise_block = True
+                # Skip this line
+                continue
             else:
-                 self.logger.warning("  翻译结果为空或过短")
-                 return None
-        except Exception as e:
-            self.logger.error(f"  翻译失败: {e}")
-            return None
+                # 遇到非干扰行
+                # 如果是看起来像正文的段落，或者代码块，或者列表
+                new_lines.append(line)
+
+        # Re-assemble
+        return "\n".join(new_lines).strip()
+
+    def _validate_content(self, content: str) -> bool:
+        """
+        验证抓取内容是否有效
+        1. 检查长度
+        2. 检查错误关键词
+        3. 检查 Medium 头部特征 (Author, Date, Read time 等)
+        """
+        if not content:
+            return False
+            
+        # 1. 长度检查
+        if len(content) < 200:
+            self.logger.warning("  验证失败: 内容过短 (< 200 chars)")
+            return False
+            
+        # 2. 错误关键词检查
+        error_keywords = [
+            "Navigation failed", 
+            "net::ERR_", 
+            "Page not found", 
+            "One more step", 
+            "Checking if the site connection is secure",
+            "404 Not Found",
+            "Sign in"
+        ]
+        for kw in error_keywords:
+            if kw in content:
+                self.logger.warning(f"  验证失败: 发现错误关键词 '{kw}'")
+                return False
+                
+        # 3. Medium Header 特征检查 (可选，过于严格可能会误杀)
+        # 检查是否包含类似 "min read" 或 "Following" 等特征
+        # 或者检查是否包含 Markdown 的一级标题
+        # 我们用一个宽松的规则：如果是 Medium 文章，通常会有 "min read"
+        # 但有些非 Medium 域名的文章可能没有。我们只并在内容较短时作为辅助判断。
+        if "min read" not in content and len(content) < 1000:
+             self.logger.warning("  验证警示: 未发现 'min read' 且内容较短，可能非完整文章。")
+             # 这里暂不强制返回 False，以免误杀 RSS 聚合的短文，但这是一个信号
+             
+        return True
+
+    def _detect_language(self, content: str) -> str:
+        """
+        简单语言检测
+        Return: 'zh', 'en', or 'other'
+        """
+        # 采样前 1000 字符
+        sample = content[:1000]
+        
+        # 1. 检测中文: 统计中文字符比例
+        # 常用汉字 Unicode 范围: \u4e00-\u9fff
+        zh_chars = re.findall(r'[\u4e00-\u9fff]', sample)
+        if len(zh_chars) > len(sample) * 0.05: # 如果超过 5% 是中文
+             if len(zh_chars) > 10:
+                 return 'zh'
+        
+        # 2. 检测英文: 简单的 ASCII 字母统计
+        # 如果不是中文，且含有大量英文字符
+        en_chars = re.findall(r'[a-zA-Z]', sample)
+        if len(en_chars) > len(sample) * 0.5:
+            return 'en'
+            
+        return 'other'
 
     def get_extraction_prompt(self, url: str) -> str:
         """返回抓取使用的 Prompt (优化版：JS 优先，禁用 Snaphot)"""
@@ -231,26 +367,63 @@ class Retriever(ABC):
         () => {
             const article = document.querySelector('article') || document.querySelector('main') || document.body;
             // 移除干扰元素
-            const trash = ['script', 'style', 'iframe', 'noscript', 'header', 'footer', 'nav', '.ad', '.advertisement', '[role="complementary"]'];
+            const trash = ['script', 'style', 'iframe', 'noscript', 'header', 'footer', 'nav', '.ad', '.advertisement', '[role="complementary"]', 'button', 'label'];
             trash.forEach(sel => article.querySelectorAll(sel).forEach(el => el.remove()));
-            // 提取 Markdown (简易版)
+            
+            // 提取 Markdown (递归遍历以保留链接和图片)
             let text = '';
+            
+            // 辅助函数：清理文本节点的空白
+            const cleanText = (str) => {
+                return str.replace(/[\\n\\t]+/g, ' ').replace(/\\s+/g, ' ');
+            };
+
             const walk = (node) => {
                 if (node.nodeType === 3) { // Text
-                    text += node.textContent;
+                    text += cleanText(node.textContent);
                 } else if (node.nodeType === 1) { // Element
                     const tag = node.tagName.toLowerCase();
-                    if (tag === 'h1') text += `\\n# ${node.innerText}\\n\\n`;
-                    else if (tag === 'h2') text += `\\n## ${node.innerText}\\n\\n`;
-                    else if (tag === 'h3') text += `\\n### ${node.innerText}\\n\\n`;
-                    else if (tag === 'p') text += `\\n${node.innerText}\\n\\n`;
-                    else if (tag === 'li') text += `- ${node.innerText}\\n`;
-                    else if (tag === 'pre' || tag === 'code') text += `\\n\`\`\`\\n${node.innerText}\\n\`\`\`\\n\\n`;
-                    else Array.from(node.childNodes).forEach(walk);
+                    
+                    if (tag === 'h1') { text += `\\n# `; Array.from(node.childNodes).forEach(walk); text += `\\n\\n`; }
+                    else if (tag === 'h2') { text += `\\n## `; Array.from(node.childNodes).forEach(walk); text += `\\n\\n`; }
+                    else if (tag === 'h3') { text += `\\n### `; Array.from(node.childNodes).forEach(walk); text += `\\n\\n`; }
+                    else if (tag === 'p') { text += `\\n`; Array.from(node.childNodes).forEach(walk); text += `\\n\\n`; }
+                    else if (tag === 'li') { text += `- `; Array.from(node.childNodes).forEach(walk); text += `\\n`; }
+                    else if (tag === 'ul' || tag === 'ol') { Array.from(node.childNodes).forEach(walk); text += `\\n`; }
+                    else if (tag === 'pre' || tag === 'code') { 
+                        // Code block / Inline code: 使用 innerText 保留原有格式
+                        // 简单的判断：如果是 pre，视为代码块；code 视为行内(除非在 pre 内)
+                        if (tag === 'pre') text += `\\n\`\`\`\\n${node.innerText}\\n\`\`\`\\n\\n`;
+                        else text += `\`${node.innerText}\``; 
+                    }
+                    else if (tag === 'a') {
+                        const href = node.getAttribute('href');
+                        text += `[`; 
+                        Array.from(node.childNodes).forEach(walk); 
+                        text += `](${href})`;
+                    }
+                    else if (tag === 'img') {
+                        const src = node.getAttribute('src');
+                        const alt = node.getAttribute('alt') || '';
+                        if (src) text += `![${alt}](${src})`;
+                    }
+                    else if (tag === 'br') {
+                        text += '\\n';
+                    }
+                    else if (tag === 'div' || tag === 'section' || tag === 'span') {
+                        // 通用容器，直接递归
+                        Array.from(node.childNodes).forEach(walk);
+                    }
+                    else {
+                        // 其他标签，直接递归
+                        Array.from(node.childNodes).forEach(walk);
+                    }
                 }
             };
+            
             walk(article);
-            return text;
+            // 后处理：清理多余的换行
+            return text.replace(/\\n{3,}/g, '\\n\\n').trim();
         }
         """
         return f"""
@@ -260,7 +433,7 @@ class Retriever(ABC):
 
         1. **导航 (Fast)**：
            - 调用 `navigate_page` 打开链接。
-           - **必须设置 `timeout` 参数为 15000** (15秒)，防止页面卡死。
+           - **必须设置 `timeout` 参数为 30000** (30秒)，防止页面卡死。
 
         2. **提取 (JS Injection)**：
            - **直接且仅使用** `evaluate_script` 工具。
@@ -278,30 +451,11 @@ class Retriever(ABC):
            - 如果失败，回复错误原因。
         """
 
-    def get_translation_prompt(self, content: str) -> str:
-        """返回翻译使用的 Prompt"""
-        return f"""
-        目标：将以下 Markdown 内容翻译为专业、流畅的中文，并清理排版。
-
-        内容：
-        {content}
-
-        要求：
-        1. **清洗与排版**：
-           - **去除噪音**：在翻译过程中，智能识别并去除原文中混入的网页 UI 元素文本（如 "Listen", "Share", "Follow", "Just now", "min read", "Press enter to view" 等）。
-           - **格式规范**：修复多余的空行，确保段落之间只有一行空行。
-        2. **准确翻译**：
-           - 准确传达原意，行文流畅，符合中文技术阅读习惯。
-           - **术语保留**：对于专业术语 (Technical Terms)、特有概念或不确定的表达，必须采用 **"中文翻译 (Original English Phrase)"** 的格式。例如："提示工程 (Prompt Engineering)" 或 "上下文感知 (Context Awareness)"。
-        3. **结构保持**：保持原文的核心 Markdown 结构（标题、代码块、列表），但可以根据上述清洗要求微调。
-        4. **输出**：仅返回翻译后的 Markdown 内容，不要包含任何额外的解释。
-        """
-
     async def fetch_and_save(
         self, url: str, title: str, category: str, feed_url: str = None
     ) -> bool:
-        """组合方法：抓取 -> 保存原文 -> 翻译 -> 保存译文"""
-        self.logger.info(f"\n  --- 处理文章: '{title}' ---")
+        """组合方法：抓取 -> 保存原文 (不翻译)"""
+        self.logger.info(f"\\n  --- 处理文章: '{title}' ---")
 
         # 检查原文是否已存在（避免重复抓取）
         today_str = datetime.date.today().isoformat()
@@ -311,66 +465,43 @@ class Retriever(ABC):
         )
         original_filepath = os.path.join(output_dir, original_filename)
 
-        content = None
         if os.path.exists(original_filepath):
              self.logger.info(f"  原文已存在，跳过抓取: '{original_filename}'")
-             # 如果原文存在，尝试读取它以便后续翻译（如果译文不存在）
-             # 但为了简单，这里假设如果原文存在就不重新抓取了。
-             # 除非我们想只补全译文。这是一个优化点。
-             # 现在的逻辑：如果原文存在，我们假设不需要再做任何事，或者读取它？
-             # 让我们读取它，以防译文需要生成。
-             try:
-                 with open(original_filepath, "r", encoding="utf-8") as f:
-                     # Skip frontmatter/headers we added
-                     lines = f.readlines()
-                     # Find where content starts (after "---")
-                     try:
-                        sep_idx = lines.index("---\n")
-                        content = "".join(lines[sep_idx+2:]) # +2 to skip --- and blank line
-                     except ValueError:
-                        content = "".join(lines)
-             except Exception:
-                 pass
+             return True
         else:
-            # 抓取原文
-            content = await self.fetch_article_content(url)
-            if content:
-                self.save_article_to_file(title, url, category, content, feed_url, suffix="")
-            else:
-                self.logger.warning(f"  未能抓取文章 '{title}' 的内容。")
+            # 抓取原文 (带重试机制)
+            max_retries = 3
+            content = None
+            
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    self.logger.info(f"  重试抓取 ({attempt+1}/{max_retries})...")
+                    # 线性退避，避免过于频繁
+                    await asyncio.sleep(2 * attempt)
+                    
+                content = await self.fetch_article_content(url)
+                
+                if content:
+                    break
+                else:
+                    self.logger.warning(f"  抓取尝试 {attempt+1} 失败。")
+            
+            if not content:
+                self.logger.warning(f"  在 {max_retries} 次尝试后仍未能抓取文章 '{title}' 的内容。")
                 return False
 
-        # 翻译并保存
-        if content:
-            # 检查译文是否存在
-            cn_filename = f"{self.sanitize_filename(title)}_cn.md"
-            cn_filepath = os.path.join(output_dir, cn_filename)
-            if os.path.exists(cn_filepath):
-                self.logger.info(f"  译文已存在，跳过翻译: '{cn_filename}'")
-                return True
+            # --- 语言检测 ---
+            lang = self._detect_language(content)
+            self.logger.info(f"  语言检测结果: {lang}")
+            
+            if lang == 'other':
+                self.logger.error(f"  文章语言非中英文 ({lang})，停止处理: {title}")
+                return False
+                
+            # 保存原文 (无论中英文都保存)
+            self.save_article_to_file(title, url, category, content, feed_url, suffix="")
 
-            # 异步触发翻译任务
-            task = asyncio.create_task(
-                self.process_translation(title, url, category, content, feed_url, output_dir, cn_filename)
-            )
-            self.tasks.add(task)
-            task.add_done_callback(self.tasks.discard)
-            self.logger.info(f"  已启动后台翻译任务: {title}")
-            return True
-        
-        return False
-
-    async def process_translation(self, title, url, category, content, feed_url, output_dir, cn_filename):
-        """后台翻译任务处理"""
-        cn_filepath = os.path.join(output_dir, cn_filename)
-        if os.path.exists(cn_filepath):
-             return
-
-        translated_content = await self.translate_article(content)
-        if translated_content:
-            self.save_article_to_file(title, url, category, translated_content, feed_url, suffix="_cn")
-        
-        return False
+        return True
 
     async def run_context(self):
         """Helper to use in async with"""
