@@ -52,8 +52,18 @@ PROMPT_RETRY_FORMAT_ERROR = """
 """
 
 def sanitize_filename(name):
-    # 移除文件名中不允许的字符，替换空格为下划线，并限制长度
-    return re.sub(r'[\\/*?:"<>|]', "", name).strip().replace(" ", "_")[:100]
+    """清洗文件名：仅保留字母、数字、中文、下划线和连字符"""
+    # 1. 替换特殊连字符和空格为下划线
+    name = name.replace(" ", "_").replace("—", "_").replace("–", "_")
+    
+    # 2. 移除非安全字符 (保留 \w: [a-zA-Z0-9_] 和汉字, 以及 -)
+    safe_name = re.sub(r"[^\w\-]", "_", name)
+    
+    # 3. 合并连续下划线
+    safe_name = re.sub(r"_+", "_", safe_name)
+    
+    # 4. 去除首尾下划线并截断
+    return safe_name.strip("_")[:100]
 
 
 def extract_yaml_from_text(text):
