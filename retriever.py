@@ -290,6 +290,10 @@ class Retriever(ABC):
             # 特征 5: 纯数字 (Claps count) 或带单位数字 (1.2K)
             elif re.match(r"^\d+(\.\d+)?[KkMm]?$", stripped):
                 is_noise = True
+            
+            # 特征 6: 会员专享内容
+            elif "Member-only story" in stripped:
+                is_noise = True
                 
             if is_noise:
                 # 只有当我们还没有插入 clean header 时，如果是干扰块的一部分，我们替换它
@@ -413,10 +417,13 @@ class Retriever(ABC):
                         text += `](${href})`;
                     }
                     else if (tag === 'img') {
-                        const src = node.getAttribute('src');
+                        const src = node.getAttribute('data-src') || node.getAttribute('src');
                         const alt = node.getAttribute('alt') || '';
                         if (src) text += `![${alt}](${src})`;
                     }
+                    else if (tag === 'table') { text += `\n\n`; Array.from(node.childNodes).forEach(walk); text += `\n\n`; }
+                    else if (tag === 'tr') { text += `\n- `; Array.from(node.childNodes).forEach(walk); }
+                    else if (tag === 'td' || tag === 'th') { text += ` `; Array.from(node.childNodes).forEach(walk); }
                     else if (tag === 'br') {
                         text += '\\n';
                     }
@@ -445,17 +452,21 @@ class Retriever(ABC):
            - 调用 `navigate_page` 打开链接。
            - **必须设置 `timeout` 参数为 30000** (30秒)，防止页面卡死。
 
-        2. **提取 (JS Injection)**：
+        2. **滚动 (Lazy Load)**:
+           - 在提取前，必须确保图片已加载。
+           - 请执行 `evaluate_script` 运行 `window.scrollTo(0, document.body.scrollHeight);` 并**等待**至少 3 秒。
+
+        3. **提取 (JS Injection)**：
            - **直接且仅使用** `evaluate_script` 工具。
            - 将以下代码作为 `function` 参数传入（完全复制，不要修改）：
              {js_code}
 
-        3. **验证**：
+        4. **验证**：
            - 检查 `evaluate_script` 的返回值。
            - 如果返回值包含有效的 Markdown 文本（通常很长），说明提取成功。
            - **严禁** 调用 `take_snapshot`，除非 `evaluate_script` 报错或返回空字符串。
 
-        4. **输出**：
+        5. **输出**：
            - **CRITICAL**: 如果提取成功，**不要**在回复中包含文章内容。
            - 仅回复一个单词：`SUCCESS`。
            - 如果失败，回复错误原因。

@@ -32,7 +32,7 @@ class Agent:
     """
     LangChain Agent with native MCP Support (Async)
     """
-    def __init__(self, model_name: str, mcp_config: Optional[Dict[str, Any]] = None, allowed_tools: Optional[List[str]] = None):
+    def __init__(self, model_name: str, mcp_config: Optional[Dict[str, Any]] = None, allowed_tools: Optional[List[str]] = None, max_tokens: Optional[int] = None):
         self.model_name = model_name
         self.mcp_config = mcp_config
         self.allowed_tools = allowed_tools
@@ -53,7 +53,8 @@ class Agent:
             api_key=api_key,
             base_url=api_ep,
             temperature=0.7,
-            streaming=True
+            streaming=True,
+            max_tokens=max_tokens
         )
 
     async def __aenter__(self):
