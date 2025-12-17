@@ -403,8 +403,8 @@ class Retriever(ABC):
                     else if (tag === 'pre' || tag === 'code') { 
                         // Code block / Inline code: 使用 innerText 保留原有格式
                         // 简单的判断：如果是 pre，视为代码块；code 视为行内(除非在 pre 内)
-                        if (tag === 'pre') text += `\\n\`\`\`\\n${node.innerText}\\n\`\`\`\\n\\n`;
-                        else text += `\`${node.innerText}\``; 
+                        if (tag === 'pre') text += `\\n\\`\\`\\`\\n${node.innerText}\\n\\`\\`\\`\\n\\n`;
+                        else text += `\\`${node.innerText}\\``; 
                     }
                     else if (tag === 'a') {
                         const href = node.getAttribute('href');
