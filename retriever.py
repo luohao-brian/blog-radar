@@ -10,6 +10,7 @@ from typing import Optional, List, Dict
 
 from agent import Agent
 from logger import setup_logging
+from text_cleaner import TextCleaner
 
 
 class Retriever(ABC):
@@ -17,6 +18,7 @@ class Retriever(ABC):
     通用文章抓取基类 (Base Retriever)
     负责 Agent 初始化、MCP 配置加载、通用文件操作和核心抓取逻辑。
     """
+
 
     def __init__(
         self, config_path: str = "mcp-settings.json", output_dir: str = "articles"
@@ -269,31 +271,8 @@ class Retriever(ABC):
                 new_lines.append(line)
                 continue
             
-            is_noise = False
-            
-            # 特征 1: 包含 "Following" 和 "read" (e.g. "Following 12 min read")
-            if "Following" in stripped and "read" in stripped:
-                is_noise = True
-            
-            # 特征 2: 只是 "Listen", "Share", "More" 等短语
-            elif stripped in ["Listen", "Share", "More", "Open in app"]:
-                is_noise = True
-                
-            # 特征 3: 包含作者头像链接 ([![...](...))
-            elif stripped.startswith("[![") and "](/@" in stripped:
-                is_noise = True
-            
-            # 特征 4: 日期行 (e.g. Nov 4, 2025) - 往往和 Following 在一起，但也可能单独
-            elif "min read" in stripped:
-                is_noise = True
-            
-            # 特征 5: 纯数字 (Claps count) 或带单位数字 (1.2K)
-            elif re.match(r"^\d+(\.\d+)?[KkMm]?$", stripped):
-                is_noise = True
-            
-            # 特征 6: 会员专享内容
-            elif "Member-only story" in stripped:
-                is_noise = True
+            # 使用 TextCleaner 判断噪音行
+            is_noise = TextCleaner.is_noise_line(line)
                 
             if is_noise:
                 # 只有当我们还没有插入 clean header 时，如果是干扰块的一部分，我们替换它
@@ -305,11 +284,14 @@ class Retriever(ABC):
                 continue
             else:
                 # 遇到非干扰行
-                # 如果是看起来像正文的段落，或者代码块，或者列表
+                # 如果是看起来像正文的段落，或者代码块，或者或者列表
                 new_lines.append(line)
 
         # Re-assemble
-        return "\n".join(new_lines).strip()
+        result = "\n".join(new_lines).strip()
+        
+        # 全局清洗 (替换行内噪音)
+        return TextCleaner.clean_global_noise(result)
 
     def _validate_content(self, content: str) -> bool:
         """

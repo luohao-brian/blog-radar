@@ -8,6 +8,7 @@ from typing import List, Optional, Dict
 
 from agent import Agent
 from logger import setup_logging
+from text_cleaner import TextCleaner
 
 class Translator:
     def __init__(self, config_path: str = "mcp-settings.json"):
@@ -61,10 +62,14 @@ class Translator:
            - **标注改写**：如果遇到无法直译或必须大幅改写/裁剪的地方，必须在译文后用括号标注原文：`(原文: ...)`。
            - 术语保留：采用 **"中文翻译 (Original English Phrase)"** 格式。
         5. **清洗与排版**：
-           - 去除网页 UI 噪音（"Listen", "Share", "min read" 等）。
+           - 去除网页 UI 噪音（"Listen", "Share", "min read", "Press enter or click to view image in full size" 等）。
            - 确保段落之间只有一行空行。
         6. **输出**：仅返回翻译后的 Markdown 内容，不要包含任何额外的解释或代码块标记。
         """
+
+    def _clean_translated_content(self, content: str) -> str:
+        """清洗翻译后的内容，移除特定噪音"""
+        return TextCleaner.clean_global_noise(content)
 
     def _split_text_smart(self, text: str, max_length: int) -> List[str]:
         """智能分段：按段落分割文本"""
@@ -121,7 +126,8 @@ class Translator:
                 self.logger.error(f"片段 {i+1} 处理失败: {e}")
                 translated_chunks.append(f"\n[Translation Error for Chunk {i+1}]\n")
         
-        return "\n\n".join(translated_chunks)
+        combined_text = "\n\n".join(translated_chunks)
+        return self._clean_translated_content(combined_text)
 
     async def process_file(self, file_path: str):
         """处理单个文件"""
