@@ -13,42 +13,30 @@ import re
 from logger import setup_logging
 
 # 配置日志
-logger = setup_logging(name="toutiao_video")
+logger = setup_logging(name="douyin_video")
 
 
 def sanitize_filename(name: str) -> str:
-    """清洗文件名：优化版 (User Preference: Hyphen style)
-    1. 移除常见的后缀
-    2. 移除引号、括号
-    3. 将冒号、问号、空格等分隔符转换为连字符 '-'
-    4. 移除其他非法字符
-    """
+    """清洗文件名：优化版 (User Preference: Hyphen style)"""
     if not name:
         return "video_download"
     
     # 0. 移除常见的后缀
-    name = name.replace(" - 今日头条", "")
+    name = name.replace(" - 抖音", "")
     
-    # 1. 直接移除的字符 (引号, 括号)
-    # include: " ' ( ) [ ] { } “ ” ‘ ’ （ ） 【 】 《 》 「 」
+    # 1. 直接移除的字符
     name = re.sub(r"[\"\'\(\)\[\]\{\}“”‘’（）【】《》「」]", "", name)
 
-    # 2. 替换为连字符的字符 (空格, 常见分隔符: - | : ， 。 ！ ？ 、)
-    # Note: We replace them with a SINGLE hyphen
+    # 2. 替换为连字符的字符
     name = re.sub(r"[\s\|\:\,\.\!\?\,\。\！\？\、_]+", "-", name)
     
-    # 3. 移除非安全字符 (保留 \w: [a-zA-Z0-9] 和汉字 和 -)
-    # We allow hyphen now. And we remove underscore from allowed list if we want pure hyphen style?
-    # Let's keep underscore in regex but we already replaced specific chars with hyphen.
-    # regex \w includes underscore.
+    # 3. 移除非安全字符 (保留 \w 和 -)
     name = re.sub(r"[^\w\-]", "", name)
     
-    # 4. 合并连续连字符 (以及可能残留的下划线转连字符?)
-    # 用户倾向于使用 - 
+    # 4. 合并连续连字符
     name = name.replace("_", "-")
     name = re.sub(r"\-+", "-", name)
     
-    # 5. 去除首尾连字符并截断
     return name.strip("-")[:100] or "video_download"
 
 
@@ -56,8 +44,8 @@ def download_stream(url, filename, desc):
     """流式下载文件"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://www.toutiao.com/",  # 有些流需要 Referer
-        "Origin": "https://www.toutiao.com",
+        "Referer": "https://www.douyin.com/",
+        "Origin": "https://www.douyin.com",
     }
 
     logger.info(f"开始下载 {desc} ...")
@@ -74,13 +62,13 @@ def download_stream(url, filename, desc):
                         downloaded += len(chunk)
                         if (
                             total_size > 0 and downloaded % (1024 * 1024) == 0
-                        ):  # Print every MB
+                        ):
                             percent = (downloaded / total_size) * 100
                             print(
                                 f"\r  进度: {percent:.1f}% ({downloaded//1024//1024}MB / {total_size//1024//1024}MB)",
                                 end="",
                             )
-            print()  # Newline
+            print() 
         logger.info(f"{desc} 下载完成: {filename}")
         return True
     except Exception as e:
@@ -95,13 +83,11 @@ browser_sem = asyncio.Semaphore(1)
 async def sniff_video_streams(target_url, model_name="doubao-seed-1-6-251015"):
     """使用 MCP Agent 嗅探音视频流地址"""
 
-    # MCP 配置
     mcp_config = {
         "command": "npx",
         "args": ["chrome-devtools-mcp@latest", "--browser-url=http://127.0.0.1:9333"],
     }
 
-    # 允许的工具
     allowed_tools = [
         "navigate_page",
         "list_network_requests",
@@ -122,34 +108,43 @@ async def sniff_video_streams(target_url, model_name="doubao-seed-1-6-251015"):
             logger.info(f"正在通过 Chrome 嗅探页面: {target_url}")
 
             prompt = f"""
-            任务：深入分析该页面的网络请求，找到完整的视频下载方案。
+            任务：深入分析抖音视频页面的网络请求，提取视频真实下载地址。
             
             目标页面：{target_url}
             
-            背景信息：
-            现在的视频网站（如今日头条/抖音/B站）通常采用 DASH 技术，将视频画面（Video Stream）和音频声音（Audio Stream）分开传输。
-            目标是解析出这两个分流的直接下载地址。
+            背景：抖音 Web 端通常会发起一个较大的 MP4 文件请求（video/mp4），或者是音视频分离的流。
             
-            请执行以下步骤：
-            1. 使用 `new_page` 创建一个新页面（防止 No page selected 错误），然后使用 `navigate_page` 打开目标页面。
-            2. **等待逻辑**: 请使用 `evaluate_script` 本身进行 15 秒的强制等待（例如执行 `await new Promise(r => setTimeout(r, 15000))` 或类似逻辑），**切勿**使用 `wait_for` 工具等待某个 DOM 选择器，因为这极易导致超时错误。确保视频开始播放且请求已发出即可。
-            3. 使用 `list_network_requests` 获取所有网络请求。
-               **重要提示**: 如果你尝试筛选资源类型，必须使用 ``["media"]`` 而**不是** ``["video"]`` (后者会导致参数错误)。
-            4. **关键步骤**：仔细分析请求列表，寻找以下两类 URL：
-               - **视频流 (Video Stream)**: 通常包含 `video`, `avc1`, `mime_type=video_mp4`，且体积较大。
-               - **音频流 (Audio Stream)**: 通常包含 `audio`, `aac`, `mp4a`，或者 `mime_type=audio_mp4`。
-               - 请优先选择没有过期时间或签名的长链接，或者最新捕获的链接。
-            5. **提取标题**: 获取页面标题。**如果标题包含“：”或“_”等分隔符，请尝试提取冒号后或最核心的描述部分，去除修饰性前缀（如“xxx的奇迹：...”）。**
+            执行步骤：
+            1. **打开页面**: 
+               - 使用 `new_page` 确保环境干净。
+               - 使用 `navigate_page` 访问目标 URL。
             
-            6. 输出报告：
-               不要废话，请仅以纯 JSON 格式输出结果，不要包含 Markdown 标记（如 ```json ... ```）：
+            2. **交互与等待 (至关重要)**:
+               - 页面加载后，可能会有登录弹窗或静音状态。
+               - 请先等待 5 秒 (`evaluate_script`: `await new Promise(r => setTimeout(r, 5000))`)。
+               - **尝试点击**: 使用 `evaluate_script` 模拟点击页面中心，触发播放或关闭遮罩。
+                 例如: `try {{ document.elementFromPoint(window.innerWidth/2, window.innerHeight/2).click(); }} catch(e) {{}}`
+               - 再强制等待 10 秒，让媒体流请求完全发出。
+            
+            3. **捕获请求**:
+               - 使用 `list_network_requests`。注意：如果筛选资源类型，必须使用 ``["media"]``，**严禁**使用 ``["video"]`` (会导致参数错误)。
+               - 筛选不仅是 `video` 或 `avc1`，也要注意 `mime_type` 为 `video/mp4` 的所有请求。
+               - 对于抖音，往往有一个请求是完整的视频文件。优先找这个。
+            
+            4. **获取信息**:
+               - 提取页面标题。
+            
+            5. **输出结果**:
+               请严格返回如下 JSON 格式，不要包含 Markdown 标记：
                {{
-                 "video_url": "URL_STRING_HERE",
-                 "audio_url": "URL_STRING_HERE",
-                 "title": "PAGE_TITLE_HERE"
+                 "video_url": "HTTP_URL",
+                 "audio_url": "HTTP_URL_OR_EMPTY",
+                 "title": "PAGE_TITLE"
                }}
                
-               如果只找到其中一个，另一个留空字符串。如果都找不到，返回空 JSON。
+               - 如果找到了单一的 MP4 视频文件（既包含画面也包含声音），填入 video_url，audio_url 留空。
+               - 如果是分流（视频流+音频流），分别填入。
+               - 务必选择 URL 最长、包含 token/sign 参数的链接。
             """
 
             messages = [{"role": "user", "content": prompt}]
@@ -159,7 +154,6 @@ async def sniff_video_streams(target_url, model_name="doubao-seed-1-6-251015"):
                 response = await agent.achat_with_tools(messages)
                 logger.info("Agent 嗅探结束")
 
-                # 清理 Markdown 代码块标记（如果 Agent 还是输出了）
                 cleaned_response = response.strip()
                 if cleaned_response.startswith("```json"):
                     cleaned_response = cleaned_response[7:]
@@ -176,22 +170,18 @@ async def sniff_video_streams(target_url, model_name="doubao-seed-1-6-251015"):
                 except json.JSONDecodeError:
                     logger.error(f"无法解析 Agent 返回的 JSON: {response}")
 
-                # 如果成功获取视频链接，尝试关闭页面
                 if video_url:
                     logger.info("嗅探成功，正在清理/关闭页面...")
                     try:
-                        # 构造更明确的清理 Prompt，因为 Agent 没有上下文记忆
                         cleanup_prompt = f"""
                         SYSTEM_TASK: CLEANUP
-                        1. Call `list_pages` to see all open tabs.
-                        2. Find the tab that matches the URL: {target_url}
-                           (It might be slightly different due to redirects, so look for the main part).
-                        3. Call `close_page` with the ID of that tab.
+                        1. Call `list_pages` to find the tab for {target_url}
+                        2. Call `close_page` with that ID.
                         """
                         close_msg = [{"role": "user", "content": cleanup_prompt}]
                         await agent.achat_with_tools(close_msg)
                     except Exception as e:
-                        logger.warning(f"关闭页面时遇到轻微错误 (不影响后续流程): {e}")
+                        logger.warning(f"关闭页面时遇到轻微错误: {e}")
 
                 return video_url, audio_url, title
 
@@ -219,6 +209,7 @@ async def process_single_video(url, output, is_batch=False):
 
     # Determine Output Path
     final_output = output
+    # 如果是默认值或者处于批量模式，自动从标题生成文件名
     if final_output == "downloaded_video.mp4" or is_batch:
         today = datetime.date.today().isoformat()
         safe_title = sanitize_filename(title)
@@ -231,10 +222,11 @@ async def process_single_video(url, output, is_batch=False):
     tmp_dir = os.path.join("videos", "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
 
+    # 使用时间戳避免临时文件冲突
     ts = int(time.time())
-    temp_video = os.path.join(tmp_dir, f"toutiao_temp_video_{ts}.mp4")
-    temp_audio = os.path.join(tmp_dir, f"toutiao_temp_audio_{ts}.m4a")
-
+    temp_video = os.path.join(tmp_dir, f"douyin_temp_video_{ts}.mp4")
+    temp_audio = os.path.join(tmp_dir, f"douyin_temp_audio_{ts}.m4a")
+    
     if not download_stream(video_url, temp_video, "视频流"):
         return False
 
@@ -243,7 +235,7 @@ async def process_single_video(url, output, is_batch=False):
         if download_stream(audio_url, temp_audio, "音频流"):
             has_audio = True
 
-    # 3. 合并
+    # 3. 合并或重命名
     success = False
     if has_audio:
         logger.info("正在合并音视频流 (ffmpeg)...")
@@ -266,7 +258,7 @@ async def process_single_video(url, output, is_batch=False):
             if os.path.exists(temp_video): os.remove(temp_video)
             if os.path.exists(temp_audio): os.remove(temp_audio)
     else:
-        logger.warning("未找到音频流，仅保存视频画面。")
+        logger.info("未找到独立音频流，假设视频流包含音频或仅为纯视频。")
         output_dir = os.path.dirname(final_output)
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
@@ -285,8 +277,8 @@ async def process_single_video(url, output, is_batch=False):
 @click.option("--output", "-o", default="downloaded_video.mp4", help="输出文件名 (仅在单 URL 时有效)")
 def main(url, output):
     """
-    今日头条视频下载器 (基于 Chrome DevTool MCP)
-    支持批量下载：uv run toutiao_video_downloader.py -u URL1 -u URL2
+    抖音视频下载器 (基于 Chrome DevTool MCP)
+    支持批量下载：uv run douyin_video_downloader.py -u URL1 -u URL2
     """
     urls = url # click returns a tuple for multiple=True
     total = len(urls)
